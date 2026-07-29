@@ -1,0 +1,19 @@
+[project]
+name = "skywalking-mcp"
+version = "0.1.0"
+description = "MCP server for querying Apache SkyWalking: endpoint performance metrics and trace latency hotspot analysis"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+skywalking-mcp = "skywalking_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skywalking_mcp"]
