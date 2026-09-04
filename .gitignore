@@ -1,2 +1,5 @@
 /.venv
 /info.txt
+__pycache__/
+*.pyc
+*.pyo

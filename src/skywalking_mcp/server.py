@@ -245,12 +245,12 @@ async def _search_slow_traces_impl(
 
 
 @mcp.tool()
-async def list_services(keyword: str = "", minutes: int = 30) -> dict[str, Any]:
+async def list_services(keyword: str = "", minutes: int = 10080) -> dict[str, Any]:
     """列出 SkyWalking 中的服务, 可按名称关键字过滤。用于把接口 URL/系统映射到具体服务。
 
     Args:
         keyword: 服务名关键字(不区分大小写), 空则返回全部服务。
-        minutes: 查询最近 N 分钟内有数据的服务, 默认 30。
+        minutes: 查询最近 N 分钟内有数据的服务, 默认 10080（约 1 周）。
     """
     try:
         duration = _duration(minutes)
@@ -266,7 +266,7 @@ async def list_services(keyword: str = "", minutes: int = 30) -> dict[str, Any]:
 async def search_endpoints(
     keyword: str,
     service_name: str = "",
-    minutes: int = 30,
+    minutes: int = 10080,
     limit: int = 20,
 ) -> dict[str, Any]:
     """按关键字(通常是接口 URL 路径)搜索端点。指定 service_name 时只搜该服务, 否则并发搜索全部服务。
@@ -274,7 +274,7 @@ async def search_endpoints(
     Args:
         keyword: 端点名关键字, 如 /login/checkToken。
         service_name: 可选, 限定服务名。
-        minutes: 时间范围(最近 N 分钟), 默认 30。
+        minutes: 时间范围(最近 N 分钟), 默认 10080（约 1 周）。
         limit: 每个服务返回的端点数上限, 默认 20。
     """
     try:
@@ -292,7 +292,7 @@ async def search_endpoints(
 async def get_endpoint_performance(
     endpoint_name: str,
     service_name: str,
-    minutes: int = 30,
+    minutes: int = 10080,
     step: str = "MINUTE",
     start_time: str | None = None,
     end_time: str | None = None,
@@ -302,7 +302,7 @@ async def get_endpoint_performance(
     Args:
         endpoint_name: 端点名(须为 Entry 端点, 如 {POST}/login/checkToken), 可用 search_endpoints 获取。
         service_name: 端点所属服务名。
-        minutes: 相对时间窗口(最近 N 分钟), 默认 30。
+        minutes: 相对时间窗口(最近 N 分钟), 默认 10080（约 1 周）。
         step: 时间桶粒度 MINUTE/HOUR/DAY, 默认 MINUTE。
         start_time: 可选绝对开始时间 yyyy-MM-dd HH:mm(东八区), 与 end_time 同时提供时覆盖 minutes。
         end_time: 可选绝对结束时间 yyyy-MM-dd HH:mm。
@@ -318,7 +318,7 @@ async def get_endpoint_performance(
 async def search_slow_traces(
     service_name: str,
     endpoint_name: str = "",
-    minutes: int = 30,
+    minutes: int = 10080,
     min_trace_duration_ms: int = 0,
     limit: int = 10,
     trace_state: str = "ALL",
@@ -330,7 +330,7 @@ async def search_slow_traces(
     Args:
         service_name: 服务名。
         endpoint_name: 可选, 限定端点名。
-        minutes: 相对时间窗口(最近 N 分钟), 默认 30。
+        minutes: 相对时间窗口(最近 N 分钟), 默认 10080（约 1 周）。
         min_trace_duration_ms: 只返回耗时大于该值(毫秒)的链路, 0 表示不限制。
         limit: 返回条数, 默认 10。
         trace_state: ALL/SUCCESS/ERROR, 默认 ALL。
@@ -366,7 +366,7 @@ async def analyze_trace(trace_id: str) -> dict[str, Any]:
 async def analyze_endpoint(
     url: str,
     service_name: str = "",
-    minutes: int = 30,
+    minutes: int = 10080,
     min_trace_duration_ms: int = 0,
     start_time: str | None = None,
     end_time: str | None = None,
@@ -376,7 +376,7 @@ async def analyze_endpoint(
     Args:
         url: 接口 URL 或路径, 如 http://host/api/login/checkToken 或 /login/checkToken。
         service_name: 可选, 已知所属服务时可加速定位。
-        minutes: 相对时间窗口(最近 N 分钟), 默认 30。
+        minutes: 相对时间窗口(最近 N 分钟), 默认 10080（约 1 周）。
         min_trace_duration_ms: 慢链路过滤阈值(毫秒), 0 表示不限制。
         start_time: 可选绝对开始时间 yyyy-MM-dd HH:mm(东八区), 与 end_time 同时提供时覆盖 minutes。
         end_time: 可选绝对结束时间 yyyy-MM-dd HH:mm。
