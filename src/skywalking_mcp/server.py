@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -16,6 +16,7 @@ except ImportError:  # mcp 1.x
 
 from . import analysis
 from .client import (
+    STEP_FORMATS,
     SkyWalkingClient,
     SkyWalkingError,
     build_duration,
@@ -36,6 +37,11 @@ PERCENTILE_LABELS = {"0": "p50", "1": "p75", "2": "p90", "3": "p95", "4": "p99"}
 ENDPOINT_SEARCH_CONCURRENCY = 10
 TRACE_STATES = {"ALL", "SUCCESS", "ERROR"}
 
+# 分钟粒度性能查询的桶数上限: 超过后 OAP 可能报原始 GraphQL 错误, 自动降为 HOUR/DAY
+MINUTE_BUCKET_MAX = 500
+# 超过该分钟数(≈20.8 天)直接降为 DAY 粒度
+MINUTE_DAY_THRESHOLD = 30000
+
 
 def _duration(
     minutes: int,
@@ -55,6 +61,95 @@ def _duration(
 def _ts_to_local(ms: int | str) -> str:
     dt = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
     return dt.astimezone(ZoneInfo(_config.timezone)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _span_minutes(duration: dict[str, str]) -> int:
+    """Duration 跨度的分钟数."""
+    fmt = STEP_FORMATS.get(duration.get("step", "MINUTE"), STEP_FORMATS["MINUTE"])
+    try:
+        start = datetime.strptime(duration["start"], fmt)
+        end = datetime.strptime(duration["end"], fmt)
+    except (ValueError, KeyError):
+        return 0
+    return max(0, int((end - start).total_seconds() / 60))
+
+
+def _coarser_duration(
+    duration: dict[str, str],
+) -> tuple[dict[str, str], int] | None:
+    """性能查询自动降粒度: MINUTE 桶数 > 上限时升为 HOUR(跨度过长则 DAY)。
+
+    Returns (new_duration, minutes_per_bucket_scale) 或 None(无需调整)。
+    桶内假设为"每桶总调用量", 除以 scale 可得等效每分钟, 供汇总/趋势使用。
+    """
+    if duration["step"] not in ("MINUTE", "HOUR"):
+        return None
+    minutes = _span_minutes(duration)
+    step = duration["step"]
+    if step == "MINUTE":
+        if minutes <= MINUTE_BUCKET_MAX:
+            return None
+        # 对齐小时边界最多多出 1~2 桶, 接近 ~500 桶上限时直接跨到 DAY
+        target = "HOUR" if minutes < MINUTE_DAY_THRESHOLD else "DAY"
+    else:  # HOUR
+        # HOUR 窗口的分钟数本就是 60 的整数倍, 直接按桶数判断
+        if minutes // 60 <= MINUTE_BUCKET_MAX:
+            return None
+        target = "DAY"
+
+    old_fmt = STEP_FORMATS[step]
+    new_fmt = STEP_FORMATS[target]
+    start = datetime.strptime(duration["start"], old_fmt)
+    end = datetime.strptime(duration["end"], old_fmt)
+    if target == "HOUR":
+        start = start.replace(minute=0, second=0, microsecond=0)
+        if end.minute or end.second or end.microsecond:
+            end = end.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        else:
+            end = end.replace(second=0, microsecond=0)
+    else:  # DAY
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        if end.hour or end.minute or end.second or end.microsecond:
+            end = end.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    new_duration = {
+        "start": start.strftime(new_fmt),
+        "end": end.strftime(new_fmt),
+        "step": target,
+    }
+    scale = {"HOUR": 60, "DAY": 1440}[target]
+    return new_duration, scale
+
+
+def _trace_retention_note(duration: dict[str, str]) -> str | None:
+    """当查询窗口早于链路保留期时给出提示, 避免把 total 偏小误判为"没被调用过"."""
+    days = max(1, getattr(_config, "trace_retention_days", 7))
+    try:
+        start = datetime.strptime(
+            duration["start"], STEP_FORMATS.get(duration["step"], STEP_FORMATS["MINUTE"])
+        )
+    except (ValueError, KeyError):
+        return None
+    tzinfo = ZoneInfo(_config.timezone)
+    start_local = start.replace(tzinfo=tzinfo)
+    if start_local >= datetime.now(tzinfo) - timedelta(days=days):
+        return None
+    return (
+        f"注意: SkyWalking 链路(span)通常只保留近 {days} 天, "
+        f"{start_local:%Y-%m-%d %H:%M} 之前的数据可能已被清理, total/采样可能偏小; "
+        f"若确认那段时间确有调用, 需先核对 OAP 存储 TTL"
+    )
+
+
+def _friendly_error(e: Exception) -> str:
+    """把 OAP 原始 GraphQL 错误包装成带方向的提示."""
+    text = str(e)
+    if "GraphQL 错误" not in text:
+        return text
+    return (
+        f"{text} | 提示: 原始 GraphQL 错误常源于 窗口x粒度 超 OAP 限制或指标不存在。"
+        f"分钟粒度已自动在窗口 > {MINUTE_BUCKET_MAX} 分钟时降为 HOUR/DAY; "
+        f"若窗口很短仍报错, 多为端点/服务不存在或非 Entry 端点, 请先用 search_endpoints 确认。"
+    )
 
 
 async def _resolve_service(service_name: str, duration: dict[str, str]) -> dict[str, str]:
@@ -129,6 +224,15 @@ async def _endpoint_performance_impl(
     service_name: str,
     duration: dict[str, str],
 ) -> dict[str, Any]:
+    # 窗口过大时自动把 MINUTE 粒度降为 HOUR/DAY, 避免 OAP 直接抛原始 GraphQL 错误
+    # (scale=每桶等效分钟数, 供把桶内总量换算成每分钟口径)。
+    orig_minutes = _span_minutes(duration)
+    orig_step = duration["step"]
+    escalated = _coarser_duration(duration)
+    if escalated is not None:
+        duration, scale = escalated
+    else:
+        scale = 1
     entity = {
         "scope": "Endpoint",
         "serviceName": service_name,
@@ -173,7 +277,10 @@ async def _endpoint_performance_impl(
     summary = {
         "avg_resp_time_ms": avg_resp,
         "max_resp_time_ms": max(avg) if avg else None,
-        "throughput_cpm_avg": round(total_calls / active_buckets, 2) if active_buckets else 0,
+        # 桶粒度被放大时除以 scale 得到"等效每分钟"均摊吞吐, 便于与 MINUTE 口径直接比较
+        "throughput_cpm_avg": (
+            round(total_calls / (active_buckets * scale), 2) if active_buckets else 0
+        ),
         "total_calls": total_calls,
         "success_rate_pct": round(sla_avg / 100, 2) if sla_avg is not None else None,
         "percentiles": percentile_summary or None,
@@ -188,12 +295,19 @@ async def _endpoint_performance_impl(
         "summary": summary,
         "trend": {
             "timestamps": timestamps[:n],
-            "throughput_cpm": cpm[:n],
+            # 桶粒度放大后按 scale 换算为等效每分钟桶值
+            "throughput_cpm": [round(v / scale, 2) for v in cpm[:n]],
             "avg_resp_time_ms": avg[:n],
             "success_rate_pct": [round(v / 100, 2) for v in sla[:n]],
             "percentiles": percentile_trend or None,
         },
     }
+    if escalated is not None:
+        result["note"] = (
+            f"查询窗口 {orig_minutes} 分钟超过 {orig_step} 粒度桶数上限(约 {MINUTE_BUCKET_MAX}), "
+            f"已自动把桶粒度降为 {duration['step']}(每桶 {scale} 分钟)。趋势/汇总里的吞吐量已换算为"
+            f"等效每分钟口径; 若需精确原始桶值, 请按 ≤{MINUTE_BUCKET_MAX} 个桶拆分窗口分段查询。"
+        )
     if active_buckets == 0:
         result["hint"] = (
             "该时间范围内无调用数据。注意: 端点指标只在其作为 Entry span 的服务上产生, "
@@ -238,7 +352,11 @@ async def _search_slow_traces_impl(
         }
         for t in data.get("traces") or []
     ]
-    return {"total": data.get("total", len(traces)), "traces": traces}
+    result: dict[str, Any] = {"total": data.get("total", len(traces)), "traces": traces}
+    retention = _trace_retention_note(duration)
+    if retention:
+        result["note"] = retention
+    return result
 
 
 # ---------------------------------------------------------------- MCP tools
@@ -259,7 +377,7 @@ async def list_services(keyword: str = "", minutes: int = 10080) -> dict[str, An
             services = [s for s in services if keyword.lower() in s["name"].lower()]
         return {"total": len(services), "services": services}
     except (SkyWalkingError, ValueError) as e:
-        return {"error": str(e)}
+        return {"error": _friendly_error(e)}
 
 
 @mcp.tool()
@@ -285,7 +403,7 @@ async def search_endpoints(
             result["hint"] = "未找到端点, 可尝试缩短关键字(如只用路径最后一段), 或确认时间范围内有流量"
         return result
     except (SkyWalkingError, ValueError) as e:
-        return {"error": str(e)}
+        return {"error": _friendly_error(e)}
 
 
 @mcp.tool()
@@ -299,6 +417,9 @@ async def get_endpoint_performance(
 ) -> dict[str, Any]:
     """查询端点性能指标: 平均响应时间/吞吐量/成功率/百分位(p50~p99), 返回汇总+趋势。
 
+    注: 分钟粒度窗口超过约 500 分钟会自动降为 HOUR/DAY 桶粒度(吞吐换算为等效每分钟),
+    因此直接传默认 7 天也不会被 OAP 以原始 GraphQL 错误拒绝。
+
     Args:
         endpoint_name: 端点名(须为 Entry 端点, 如 {POST}/login/checkToken), 可用 search_endpoints 获取。
         service_name: 端点所属服务名。
@@ -311,7 +432,7 @@ async def get_endpoint_performance(
         duration = _duration(minutes, step, start_time, end_time)
         return await _endpoint_performance_impl(endpoint_name, service_name, duration)
     except (SkyWalkingError, ValueError) as e:
-        return {"error": str(e)}
+        return {"error": _friendly_error(e)}
 
 
 @mcp.tool()
@@ -326,6 +447,9 @@ async def search_slow_traces(
     end_time: str | None = None,
 ) -> dict[str, Any]:
     """按耗时降序查询链路(trace), 用于找出最慢的请求样本。
+
+    注: SkyWalking 链路通常只保留近 N 天(默认 7), 查询更早窗口时响应会附带
+    note 提示保留期, 避免把 total 偏小误判为"真的没被调用"。
 
     Args:
         service_name: 服务名。
@@ -343,14 +467,15 @@ async def search_slow_traces(
             service_name, endpoint_name, duration, min_trace_duration_ms, limit, trace_state
         )
     except (SkyWalkingError, ValueError) as e:
-        return {"error": str(e)}
+        return {"error": _friendly_error(e)}
 
 
 @mcp.tool()
 async def analyze_trace(trace_id: str) -> dict[str, Any]:
     """分析一条链路的耗时分布: 构建 span 树, 计算每个 span 的自耗时, 找出耗时热点。
 
-    返回: 总耗时/主要耗时路径(critical_path)/自耗时 Top span/按服务与组件聚合/错误 span/结论(findings)。
+    返回: 总耗时/主要耗时路径(critical_path)/自耗时 Top span/空档分析(gaps, 即 span 内
+    未被任何子 span 覆盖的时间区间, 对应未埋点/本地处理/等待)/按服务与组件聚合/结论(findings)。
 
     Args:
         trace_id: 链路 ID, 可由 search_slow_traces 获取。
@@ -359,7 +484,7 @@ async def analyze_trace(trace_id: str) -> dict[str, Any]:
         spans = await _client.query_trace(trace_id)
         return analysis.analyze_trace_spans(trace_id, spans)
     except (SkyWalkingError, ValueError) as e:
-        return {"error": str(e)}
+        return {"error": _friendly_error(e)}
 
 
 @mcp.tool()
@@ -413,7 +538,7 @@ async def analyze_endpoint(
             trace_analysis = analysis.analyze_trace_spans(slow["traces"][0]["trace_id"], spans)
 
         findings = _endpoint_findings(resolved, performance, slow, trace_analysis)
-        return {
+        result = {
             "resolved_endpoint": resolved,
             "candidates": candidates[:10],
             "performance": performance,
@@ -421,8 +546,12 @@ async def analyze_endpoint(
             "trace_analysis": trace_analysis,
             "findings": findings,
         }
+        retention = _trace_retention_note(duration)
+        if retention:
+            result["note"] = retention
+        return result
     except (SkyWalkingError, ValueError) as e:
-        return {"error": str(e)}
+        return {"error": _friendly_error(e)}
 
 
 # ------------------------------------------------- analyze_endpoint helpers

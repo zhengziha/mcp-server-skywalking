@@ -107,9 +107,15 @@ python3 -m venv .venv
 }
 ```
 
+> **自动降粒度**:分钟(MINUTE)桶窗口超过约 500 分钟时,自动升级为 HOUR/DAY 粒度并把吞吐换算成
+> 等效每分钟口径(响应带 `note` 说明)。直接传默认 7 天不会再把 OAP 的原始 GraphQL 错误抛给模型。
+
 ### 5. `search_slow_traces` — 检索慢链路
 
 按耗时降序返回链路样本:`[{trace_id, duration_ms, start_time, is_error, endpoint_names}]`。
+
+> **保留期提示**:链路(span)通常只保留近 N 天(默认 7,可用 `SKYWALKING_TRACE_RETENTION_DAYS` 调整)。
+> 查询更早窗口时响应会带 `note` 提示保留期,避免把 `total` 偏小误判成"这段时间真没被调用过"。
 
 ### 6. `analyze_trace` — 链路耗时热点分析
 
@@ -118,10 +124,12 @@ python3 -m venv .venv
 - `total_duration_ms` / `span_count` / `service_count` / `has_error`:链路概览
 - `critical_path`:主要耗时路径(从根 span 逐层选择耗时最长的子 span)
 - `top_self_time_spans`:自耗时 Top 10 的 span(含服务、组件、peer、耗时占比、tags)
+- `gaps` / `gap_stats`:**空档分析** —— 每个父 span 内未被任何子 span 覆盖的时间区间
+  (含起止时刻、时长、前后相邻 span),对应未埋点/本地处理/等待;最大的空档会进入 `findings`
 - `by_service`:按服务聚合自耗时
 - `by_layer_component`:按 Layer/组件聚合(定位 DB/Cache/HTTP/MQ 类耗时)
 - `errors`:错误 span 列表
-- `findings`:可读结论,如"耗时热点: 服务 X 的 [Mysql] SELECT... 自身耗时 800ms, 占整条链路 45%"
+- `findings`:可读结论,如"耗时热点: 服务 X 的 [Mysql] SELECT... 自身耗时 800ms, 占整条链路 45%"、空档定位
 
 ## 使用示例
 
