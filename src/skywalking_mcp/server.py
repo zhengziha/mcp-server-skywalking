@@ -364,12 +364,7 @@ async def _search_slow_traces_impl(
 
 @mcp.tool()
 async def list_services(keyword: str = "", minutes: int = 10080) -> dict[str, Any]:
-    """列出 SkyWalking 中的服务, 可按名称关键字过滤。用于把接口 URL/系统映射到具体服务。
-
-    Args:
-        keyword: 服务名关键字(不区分大小写), 空则返回全部服务。
-        minutes: 查询最近 N 分钟内有数据的服务, 默认 10080（约 1 周）。
-    """
+    """列出 SkyWalking 服务, 可按关键字过滤。用于把接口 URL/系统映射到具体服务。"""
     try:
         duration = _duration(minutes)
         services = await _client.get_all_services(duration)
@@ -387,14 +382,7 @@ async def search_endpoints(
     minutes: int = 10080,
     limit: int = 20,
 ) -> dict[str, Any]:
-    """按关键字(通常是接口 URL 路径)搜索端点。指定 service_name 时只搜该服务, 否则并发搜索全部服务。
-
-    Args:
-        keyword: 端点名关键字, 如 /login/checkToken。
-        service_name: 可选, 限定服务名。
-        minutes: 时间范围(最近 N 分钟), 默认 10080（约 1 周）。
-        limit: 每个服务返回的端点数上限, 默认 20。
-    """
+    """按关键字(通常是接口 URL 路径)搜索端点。指定 service_name 时只搜该服务, 否则并发搜索全部服务。"""
     try:
         duration = _duration(minutes)
         endpoints = await _search_endpoints_impl(keyword, service_name, duration, limit)
@@ -415,18 +403,11 @@ async def get_endpoint_performance(
     start_time: str | None = None,
     end_time: str | None = None,
 ) -> dict[str, Any]:
-    """查询端点性能指标: 平均响应时间/吞吐量/成功率/百分位(p50~p99), 返回汇总+趋势。
+    """查询端点性能指标: 平均响应/吞吐量/成功率/百分位(p50~p99), 返回汇总+趋势。
 
-    注: 分钟粒度窗口超过约 500 分钟会自动降为 HOUR/DAY 桶粒度(吞吐换算为等效每分钟),
-    因此直接传默认 7 天也不会被 OAP 以原始 GraphQL 错误拒绝。
-
-    Args:
-        endpoint_name: 端点名(须为 Entry 端点, 如 {POST}/login/checkToken), 可用 search_endpoints 获取。
-        service_name: 端点所属服务名。
-        minutes: 相对时间窗口(最近 N 分钟), 默认 10080（约 1 周）。
-        step: 时间桶粒度 MINUTE/HOUR/DAY, 默认 MINUTE。
-        start_time: 可选绝对开始时间 yyyy-MM-dd HH:mm(东八区), 与 end_time 同时提供时覆盖 minutes。
-        end_time: 可选绝对结束时间 yyyy-MM-dd HH:mm。
+    endpoint_name 须为 Entry 端点(如 {POST}/login/checkToken, 可用 search_endpoints 获取)。
+    分钟粒度窗口 >约500 分钟自动降为 HOUR/DAY 桶(吞吐换算为等效每分钟), 传默认 7 天也不会报错。
+    start_time/end_time 同时提供时(yyyy-MM-dd HH:mm, 东八区)覆盖 minutes。
     """
     try:
         duration = _duration(minutes, step, start_time, end_time)
@@ -448,18 +429,9 @@ async def search_slow_traces(
 ) -> dict[str, Any]:
     """按耗时降序查询链路(trace), 用于找出最慢的请求样本。
 
-    注: SkyWalking 链路通常只保留近 N 天(默认 7), 查询更早窗口时响应会附带
-    note 提示保留期, 避免把 total 偏小误判为"真的没被调用"。
-
-    Args:
-        service_name: 服务名。
-        endpoint_name: 可选, 限定端点名。
-        minutes: 相对时间窗口(最近 N 分钟), 默认 10080（约 1 周）。
-        min_trace_duration_ms: 只返回耗时大于该值(毫秒)的链路, 0 表示不限制。
-        limit: 返回条数, 默认 10。
-        trace_state: ALL/SUCCESS/ERROR, 默认 ALL。
-        start_time: 可选绝对开始时间 yyyy-MM-dd HH:mm(东八区)。
-        end_time: 可选绝对结束时间 yyyy-MM-dd HH:mm。
+    链路通常只保留近 7 天, 查询更早窗口时响应附 note 提示保留期, 避免把 total 偏小
+    误判为"没被调用"。min_trace_duration_ms 过滤最小耗时(毫秒, 0 不限)。
+    start_time/end_time 同时提供时(yyyy-MM-dd HH:mm, 东八区)覆盖 minutes。
     """
     try:
         duration = _duration(minutes, "SECOND", start_time, end_time)
@@ -474,11 +446,8 @@ async def search_slow_traces(
 async def analyze_trace(trace_id: str) -> dict[str, Any]:
     """分析一条链路的耗时分布: 构建 span 树, 计算每个 span 的自耗时, 找出耗时热点。
 
-    返回: 总耗时/主要耗时路径(critical_path)/自耗时 Top span/空档分析(gaps, 即 span 内
-    未被任何子 span 覆盖的时间区间, 对应未埋点/本地处理/等待)/按服务与组件聚合/结论(findings)。
-
-    Args:
-        trace_id: 链路 ID, 可由 search_slow_traces 获取。
+    返回: 总耗时/主要耗时路径(critical_path)/自耗时 Top span/空档分析(gaps)/
+    按服务与组件聚合/结论(findings)。trace_id 可由 search_slow_traces 获取。
     """
     try:
         spans = await _client.query_trace(trace_id)
@@ -498,13 +467,8 @@ async def analyze_endpoint(
 ) -> dict[str, Any]:
     """一站式接口分析(主入口): 输入接口 URL, 自动定位端点 → 查询性能指标 → 抓取最慢链路 → 分析耗时热点。
 
-    Args:
-        url: 接口 URL 或路径, 如 http://host/api/login/checkToken 或 /login/checkToken。
-        service_name: 可选, 已知所属服务时可加速定位。
-        minutes: 相对时间窗口(最近 N 分钟), 默认 10080（约 1 周）。
-        min_trace_duration_ms: 慢链路过滤阈值(毫秒), 0 表示不限制。
-        start_time: 可选绝对开始时间 yyyy-MM-dd HH:mm(东八区), 与 end_time 同时提供时覆盖 minutes。
-        end_time: 可选绝对结束时间 yyyy-MM-dd HH:mm。
+    url 传 URL 或路径(如 /login/checkToken)。start_time/end_time 同时提供时
+    (yyyy-MM-dd HH:mm, 东八区)覆盖 minutes; min_trace_duration_ms 过滤慢链路(毫秒, 0 不限)。
     """
     try:
         duration = _duration(minutes, "MINUTE", start_time, end_time)
